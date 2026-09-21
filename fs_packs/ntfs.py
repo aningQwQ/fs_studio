@@ -1035,7 +1035,7 @@ class NtfsPlotTab(TabPlugin):
 
         hbar_holder = QWidget()
         hl = QHBoxLayout(hbar_holder)
-        hl.setContentsMargins(BlockRangeChart.ML, 0, 0, BlockRangeChart.MR)
+        hl.setContentsMargins(BlockRangeChart.ML, 0, BlockRangeChart.MR, 0)
         hl.setSpacing(0)
         hl.addWidget(self.hbar)
 

@@ -298,6 +298,9 @@ class BlockRangeChart(QWidget):
     C_TEXT    = QColor('#1a1a1a')
     C_DIM     = QColor('#666666')
     C_EDGE    = QColor('#999999')
+    C_FOCUS   = QColor('#166534')   # 深绿：热力图点击后的定位高亮
+    C_FOCUS_FG = QColor('#ffffff')  # 反色文字
+    FOCUS_WIDTH = 3                 # 高亮边框粗细（px）
 
     def __init__(self, row_prefix='AG', axis_label='块号 (block)',
                  empty_text='请选择一个设备', parent=None):
@@ -496,7 +499,7 @@ class BlockRangeChart(QWidget):
                 and first <= self.focus_index <= last):
             row_y = dy + self.focus_index * row_h - self.v_offset
             p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor('#f59e0b'), 2))
+            p.setPen(QPen(self.C_FOCUS, self.FOCUS_WIDTH))
             p.drawRect(QRectF(dx, row_y + 1, dw, row_h - 2))
 
         p.restore()
@@ -506,9 +509,21 @@ class BlockRangeChart(QWidget):
             row_y = dy + i * row_h - self.v_offset
             free = sum(c for _, c in recs)
             pct = free / self.row_size * 100 if self.row_size else 0
+            focused = (self.focus_index == i)
 
-            f3 = QFont(); f3.setPointSizeF(10); f3.setBold(True)
-            p.setFont(f3); p.setPen(self.C_TEXT)
+            if focused:
+                # 类 GRUB 反色：只高亮两侧"外部"留白，内部数据区保持原色
+                y0 = max(row_y, dy)
+                y1 = min(row_y + row_h, dy + dh)
+                if y1 > y0:
+                    p.fillRect(QRectF(0, y0, dx, y1 - y0), self.C_FOCUS)
+                    p.fillRect(QRectF(dx + dw, y0, W - dx - dw, y1 - y0),
+                               self.C_FOCUS)
+
+            f3 = QFont(); f3.setPointSizeF(10.5 if focused else 10)
+            f3.setBold(True)
+            p.setFont(f3)
+            p.setPen(self.C_FOCUS_FG if focused else self.C_TEXT)
             p.drawText(QRectF(0, row_y, dx - 8, row_h),
                        Qt.AlignVCenter | Qt.AlignRight,
                        f"{self.row_prefix} {row_no}")
