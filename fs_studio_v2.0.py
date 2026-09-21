@@ -13,6 +13,7 @@ FS Studio — 多文件系统结构与性能分析器（FS 包插件化）
       core.py                     框架：注册表 + 通用图表 + 采集线程 + worker
       xfs.py                      XFS  的 collector + Tab 集合
       ext4.py                     ext2/3/4 的 collector + Tab 集合
+      ntfs.py                     NTFS 的 collector + Tab 集合
       fat.py                      FAT12/16/32 与 exFAT 的 collector + Tab 集合
     主窗口（本文件）              不认 FS，只认 "设备 + 包"
 

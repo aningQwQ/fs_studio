@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fs_packs.fat — FAT 系列包（FAT12 / FAT16 / FAT32 / exFAT）
+fs_packs.ntfs — NTFS 包
 
-FAT 与 exFAT 同属 "FAT 表 + 簇堆" 家族，放在同一模块里共享二进制读取与
-空闲簇扫描代码：
+自包含一个文件系统所需的全部内容:
+    collector : collect_ntfs()   （root 侧，直接读引导扇区 + $MFT + $Bitmap）
+    tabs      : 概览 / 簇分布 / 簇热力图 / 空闲可视化
 
-    collector : collect_fat()    （root 侧，直接读引导扇区 + FAT 表）
-                collect_exfat()  （root 侧，直接读引导扇区 + 分配位图）
-    tabs      : 概览 / 簇分布 / 簇热力图 / 空闲可视化（FAT 与 exFAT 各一套）
+直接解析 NTFS 结构（引导扇区 → $MFT 数据运行 → $Bitmap 分配位图），
+不依赖 ntfsprogs / ntfs-3g，只要求采集时有权限打开设备。
 
-不依赖 exfatprogs / dosfstools：引导扇区、FAT 表、分配位图都由本模块直接解析，
-只要求采集时有权限打开设备（采集器已由 pkexec/sudo 提权运行）。
-
-带走这个包 = 复制本文件（同时得到 FAT 与 exFAT 支持）。
+带走这个包 = 复制本文件。
 """
-import array
 import re
 import struct
-import sys
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
@@ -30,9 +25,17 @@ from PySide6.QtWidgets import (QFrame, QGroupBox, QGridLayout, QHBoxLayout,
 from .core import (BlockRangeChart, FSPack, TabPlugin, human_size,
                    register_collector, register_pack, register_tab)
 
-# 空闲可视化把簇空间切成多少行（与 ext4 的块组数量级接近，便于浏览）
 TARGET_ROWS = 128
-READ_CAP = 1 << 20          # 目录链 / 位图单次读取上限（字节）
+
+ATTR_ATTRIBUTE_LIST = 0x20
+ATTR_VOLUME_NAME = 0x60
+ATTR_VOLUME_INFO = 0x70
+ATTR_DATA = 0x80
+ATTR_BITMAP = 0xB0
+
+MFT_MFT = 0
+MFT_VOLUME = 3
+MFT_BITMAP = 6
 
 
 # =============================================================================
@@ -50,6 +53,10 @@ def _u64(b, o):
     return struct.unpack_from('<Q', b, o)[0]
 
 
+def _s8(b, o):
+    return struct.unpack_from('<b', b, o)[0]
+
+
 def _ceil_div(a, b):
     return (a + b - 1) // b
 
@@ -60,7 +67,6 @@ def _read_at(fh, offset, size):
 
 
 def _hexdump(data, base=0):
-    """把二进制数据格式化为 16 字节/行的 hexdump 文本"""
     lines = []
     for off in range(0, len(data), 16):
         chunk = data[off:off + 16]
@@ -71,50 +77,25 @@ def _hexdump(data, base=0):
     return '\n'.join(lines)
 
 
-def _chunk_rows(cluster_count, runs, target=TARGET_ROWS):
-    """
-    把连续簇空间切成若干"区"，返回 (rows, row_size)。
-    rows: [[区号, [(区内起始偏移, 簇数), ...]], ...]
-    runs: [(起始簇号, 簇数), ...]（簇号从 2 开始）
-    """
+def _chunk_rows(cluster_count, runs, base=0, target=TARGET_ROWS):
     if cluster_count <= 0:
         return [], 1
     row_size = max(1, _ceil_div(cluster_count, target))
     nrows = _ceil_div(cluster_count, row_size)
     rows = [[k, []] for k in range(nrows)]
-
     for start, count in runs:
-        s, e = start, start + count          # [s, e)
+        s, e = start, start + count
         while s < e:
-            i = (s - 2) // row_size
+            i = (s - base) // row_size
             if not (0 <= i < nrows):
                 break
-            c0 = 2 + i * row_size
-            c1 = 2 + min(cluster_count, (i + 1) * row_size)
+            c0 = base + i * row_size
+            c1 = base + min(cluster_count, (i + 1) * row_size)
             a, b = max(s, c0), min(e, c1)
             if b > a:
                 rows[i][1].append((a - c0, b - a))
             s = b
     return rows, row_size
-
-
-def _runs_from_flags(flags, cluster_count):
-    """由 "是否空闲" 序列（簇 2 起）生成空闲区间与空闲簇数（仅用于小表）"""
-    runs = []
-    free = 0
-    run_start = None
-    for i, is_free in enumerate(flags):
-        c = 2 + i
-        if is_free:
-            if run_start is None:
-                run_start = c
-            free += 1
-        elif run_start is not None:
-            runs.append((run_start, c - run_start))
-            run_start = None
-    if run_start is not None:
-        runs.append((run_start, cluster_count + 2 - run_start))
-    return runs, free
 
 
 def _free_byte_runs():
@@ -137,16 +118,15 @@ def _free_byte_runs():
 
 _FREE_BYTE_RUNS = _free_byte_runs()
 
-# 成片的 0x00/0xFF 字节整段跳过，只有"混合"字节才逐位处理
+# 成片的 0x00（全空闲）/ 0xFF（全占用）字节由 C 级正则在字节层面整段跳过，
+# 只有"混合"字节才需要逐位处理，避免 O(簇数) 的 Python 循环。
 _BITMAP_SPLIT = re.compile(rb'\x00+|\xff+|[^\x00\xff]+')
-# FAT32 表项：连续 4 个 0x00 字节 = 一个空闲簇
-_ZERO_RUN = re.compile(rb'\x00{4,}')
 
 
-def _scan_bitmap_free(bm, cluster_count, base=2):
+def _scan_bitmap_free(bm, cluster_count):
     """
-    扫描分配位图（exFAT），返回 (空闲区间, 空闲簇数)。
-    第 i 位对应簇 base+i；与 FAT/exFAT 的从 2 起编号一致（base=2）。
+    扫描 NTFS $Bitmap，返回 (空闲区间, 空闲簇数)。
+    注意：NTFS 位图第 i 位对应 LCN i（簇号从 0 开始，与 FAT/exFAT 从 2 起不同）。
     """
     runs = []
     free = 0
@@ -161,8 +141,8 @@ def _scan_bitmap_free(bm, cluster_count, base=2):
         if first == 0x00:                       # 整段空闲
             if b0 >= total:
                 break
-            a = base + b0
-            b = base + min(b0 + len(seg) * 8, total)
+            a = b0
+            b = min(b0 + len(seg) * 8, total)
             if run_start is not None and a == run_end:
                 run_end = b
             else:
@@ -178,14 +158,14 @@ def _scan_bitmap_free(bm, cluster_count, base=2):
                 run_start = None
         else:                                   # 混合字节：查表逐位
             for j, byte in enumerate(seg):
-                bb = b0 + j * 8
-                if bb >= total:
+                base = b0 + j * 8
+                if base >= total:
                     break
                 for sb, ln in _FREE_BYTE_RUNS[byte]:
-                    a = base + bb + sb
-                    if a >= base + total:
+                    a = base + sb
+                    if a >= total:
                         break
-                    b = min(a + ln, base + total)
+                    b = min(a + ln, total)
                     if run_start is not None and a == run_end:
                         run_end = b
                     else:
@@ -199,360 +179,277 @@ def _scan_bitmap_free(bm, cluster_count, base=2):
     return runs, free
 
 
-# 单个数据块里若空闲"段"过多，说明表被极度碎片化，改用逐项扫描更划算
-MAX_REGEX_RUNS = 8192
-
-
-def _fat32_chunk_regex(buf, base_index, cluster_count):
-    """
-    用 C 级正则扫描一块 FAT32 表：连续 4 个零字节的表项 = 空闲簇。
-    若空闲段数超过阈值（极度碎片化）则返回 None，由调用方回退逐项扫描。
-    """
-    out = []
-    for m in _ZERO_RUN.finditer(buf):
-        zs, ze = m.start(), m.end()
-        a = -(-zs // 4) * 4                 # 向上取整到表项边界
-        b = (ze // 4) * 4                   # 向下取整到表项边界
-        if b <= a:
-            continue
-        first = base_index + a // 4
-        last = min(base_index + b // 4, cluster_count)   # 左闭右开
-        if first >= last:
-            continue
-        out.append((2 + first, 2 + last))
-        if len(out) > MAX_REGEX_RUNS:
-            return None
-    return out
-
-
-def _scan_fat32_free(fh, fat_start, cluster_count, chunk_bytes=1 << 22):
-    """
-    扫描 FAT32 表，返回 (空闲区间, 空闲簇数)。
-    主流情况用 C 级正则整段跳过成片空闲区，避免 O(簇数) 的 Python 循环；
-    极度碎片化时按块回退为逐项扫描，避免正则匹配对象过多反而更慢。
-    """
-    start_byte = fat_start + 8              # 簇 2 的表项起点
-    total_bytes = cluster_count * 4
-    runs = []
-    free = 0
-    run_start = None
-    run_end = 0
-    done = 0
-
-    while done < total_bytes:
-        n = min(chunk_bytes, total_bytes - done)
-        n -= n % 4
-        if n <= 0:
-            n = min(4, total_bytes - done)
-        buf = _read_at(fh, start_byte + done, n)
-        if len(buf) < n:
-            raise RuntimeError("FAT 表读取不完整")
-        base_index = done // 4              # 该块第一项对应的 (簇号 - 2)
-
-        local = _fat32_chunk_regex(buf, base_index, cluster_count)
-        if local is None:
-            # 极度碎片化：逐项扫描并直接并入全局状态（不建中间列表）
-            arr = array.array('I')
-            arr.frombytes(buf)
-            if sys.byteorder != 'little':
-                arr.byteswap()
-            i, cnt = 0, len(arr)
-            while i < cnt:
-                if (arr[i] & 0x0FFFFFFF) == 0:
-                    j = i + 1
-                    while j < cnt and (arr[j] & 0x0FFFFFFF) == 0:
-                        j += 1
-                    rs = 2 + base_index + i
-                    re_ = 2 + min(base_index + j, cluster_count)
-                    if rs < re_:
-                        if run_start is not None and rs == run_end:
-                            run_end = re_
-                        else:
-                            if run_start is not None:
-                                runs.append((run_start, run_end - run_start))
-                            run_start, run_end = rs, re_
-                        free += re_ - rs
-                    i = j
-                else:
-                    i += 1
-            done += n
-            continue
-
-        for rs, re_ in local:
-            if run_start is not None and rs == run_end:
-                run_end = re_
-            else:
-                if run_start is not None:
-                    runs.append((run_start, run_end - run_start))
-                run_start, run_end = rs, re_
-            free += re_ - rs
-        done += n
-
-    if run_start is not None:
-        runs.append((run_start, run_end - run_start))
-    return runs, free
-
-
 # =============================================================================
-# Part 1 · FAT12/16/32 采集（root 侧）
+# Part 1 · NTFS 结构解析
 # =============================================================================
-def _parse_bpb(bs):
+def _parse_boot(bs):
     if len(bs) < 512 or bs[510] != 0x55 or bs[511] != 0xAA:
-        raise RuntimeError("不是有效的 FAT 引导扇区（缺少 0xAA55 签名）")
+        raise RuntimeError("不是有效的 NTFS 引导扇区（缺少 0xAA55 签名）")
+    if bs[3:11] != b'NTFS    ':
+        raise RuntimeError("不是有效的 NTFS 引导扇区（OEM 标识不是 NTFS）")
 
     bps = _u16(bs, 0x0B)
     spc = bs[0x0D]
-    reserved = _u16(bs, 0x0E)
-    nfats = bs[0x10]
-    root_entries = _u16(bs, 0x11)
-    total16 = _u16(bs, 0x13)
-    fat16 = _u16(bs, 0x16)
-    total32 = _u32(bs, 0x20)
-    fat32 = _u32(bs, 0x24)
+    total_sectors = _u64(bs, 0x28)
+    if bps not in (512, 1024, 2048, 4096) or spc == 0 or not total_sectors:
+        raise RuntimeError("NTFS 引导扇区字段非法")
 
-    if bps not in (512, 1024, 2048, 4096) or spc == 0 or nfats == 0:
-        raise RuntimeError("不是有效的 FAT 引导扇区（BPB 字段非法）")
-
-    total_sectors = total16 or total32
-    fat_size = fat16 or fat32
-    if not total_sectors or not fat_size:
-        raise RuntimeError("不是有效的 FAT 引导扇区（扇区/FAT 大小为空）")
-
-    root_dir_sectors = _ceil_div(root_entries * 32, bps) if root_entries else 0
-    data_sectors = total_sectors - (reserved + nfats * fat_size
-                                    + root_dir_sectors)
-    cluster_count = data_sectors // spc
-
-    if cluster_count < 4085:
-        ftype = 12
-    elif cluster_count < 65525:
-        ftype = 16
-    else:
-        ftype = 32
-    if cluster_count <= 0:
-        raise RuntimeError("不是有效的 FAT 文件系统（数据簇数为 0）")
-
-    data_start = reserved + nfats * fat_size + root_dir_sectors
-    if ftype == 32:
-        vol_id = _u32(bs, 0x43)
-        bpb_label = bs[0x47:0x52]
-        type_str = bs[0x52:0x5A]
-        root_cluster = _u32(bs, 0x2C)
-    else:
-        vol_id = _u32(bs, 0x27)
-        bpb_label = bs[0x2B:0x36]
-        type_str = bs[0x36:0x3E]
-        root_cluster = 0
+    cluster_size = bps * spc
+    cpm = _s8(bs, 0x40)   # clusters per MFT record（0x41..0x43 保留）
+    cpi = _s8(bs, 0x44)   # clusters per index record（0x45..0x47 保留）
+    mft_record_size = cpm * cluster_size if cpm > 0 else 1 << (-cpm)
+    index_record_size = cpi * cluster_size if cpi > 0 else 1 << (-cpi)
+    if not (256 <= mft_record_size <= 65536):
+        raise RuntimeError("NTFS MFT 记录大小非法")
 
     return {
         'bytes_per_sector': bps,
         'sectors_per_cluster': spc,
-        'reserved': reserved,
-        'nfats': nfats,
-        'root_entries': root_entries,
+        'cluster_size': cluster_size,
         'total_sectors': total_sectors,
-        'fat_size': fat_size,
-        'root_dir_sectors': root_dir_sectors,
-        'cluster_count': cluster_count,
-        'fat_type': ftype,
-        'data_start': data_start,
-        'fat_start': reserved * bps,
-        'root_cluster': root_cluster,
-        'media': bs[0x15],
-        'volume_id': vol_id,
-        'bpb_label': bpb_label.decode('latin-1').rstrip(' '),
-        'oem': bs[3:11].decode('latin-1').rstrip(' '),
-        'type_str': type_str.decode('latin-1').rstrip(' '),
+        'cluster_count': total_sectors // spc,
+        'mft_lcn': _u64(bs, 0x30),
+        'mftmirr_lcn': _u64(bs, 0x38),
+        'mft_record_size': mft_record_size,
+        'index_record_size': index_record_size,
+        'serial': _u64(bs, 0x48),
     }
 
 
-def _fat32_next(fh, fat_start, cluster):
-    return _u32(_read_at(fh, fat_start + cluster * 4, 4), 0) & 0x0FFFFFFF
-
-
-def _read_chain(fh, fat_start, heap_offset, cluster_size, start, max_bytes):
-    """沿 FAT 链读取簇数据（用于 FAT32 根目录）"""
-    out = bytearray()
-    seen = set()
-    c = start
-    while 2 <= c < 0x0FFFFFF8 and len(out) < max_bytes:
-        if c in seen:
+def _fixup(rec, sector_size):
+    """还原 NTFS 记录的更新序列（fixup），否则跨扇区字段会被 USN 覆盖"""
+    if rec[0:4] != b'FILE' or len(rec) < 0x30:
+        return rec
+    usa_off = _u16(rec, 4)
+    usa_cnt = _u16(rec, 6)
+    if usa_cnt == 0 or usa_off + usa_cnt * 2 > len(rec):
+        return rec
+    out = bytearray(rec)
+    for i in range(1, usa_cnt):
+        end = (i + 1) * sector_size
+        if end > len(out):
             break
-        seen.add(c)
-        out += _read_at(fh, heap_offset + (c - 2) * cluster_size,
-                        cluster_size)
-        c = _fat32_next(fh, fat_start, c)
+        out[end - 2:end] = rec[usa_off + 2 * i: usa_off + 2 * i + 2]
     return bytes(out)
 
 
-def _scan_fat_free(fh, bpb):
-    """读取 FAT 表，统计空闲簇并生成空闲区间"""
-    fat_start = bpb['fat_start']
-    ftype = bpb['fat_type']
-    cluster_count = bpb['cluster_count']
-
-    if ftype == 32:
-        return _scan_fat32_free(fh, fat_start, cluster_count)
-
-    if ftype == 16:
-        buf = _read_at(fh, fat_start + 4, cluster_count * 2)
-        if len(buf) < cluster_count * 2:
-            raise RuntimeError("FAT 表读取不完整")
-        arr = array.array('H')
-        arr.frombytes(buf)
-        if sys.byteorder != 'little':
-            arr.byteswap()
-        return _runs_from_flags((v == 0 for v in arr), cluster_count)
-
-    # FAT12：整表很小（< 4085 项），逐项解包 1.5 字节
-    raw = _read_at(fh, fat_start, _ceil_div((cluster_count + 2) * 3, 2) + 2)
-    flags = []
-    for i in range(2, cluster_count + 2):
-        off = i + i // 2
-        if i & 1:
-            v = (raw[off] >> 4) | (raw[off + 1] << 4)
-        else:
-            v = raw[off] | ((raw[off + 1] & 0x0F) << 8)
-        flags.append(v == 0)
-    return _runs_from_flags(flags, cluster_count)
-
-
-def _label_from_dir(data):
-    for i in range(0, len(data) - 31, 32):
-        e = data[i:i + 32]
-        if e[0] == 0x00:
-            break
-        if e[0] == 0xE5:
-            continue
-        attr = e[11]
-        if attr == 0x0F:            # LFN 长文件名项
-            continue
-        if attr & 0x08:             # 卷标项
-            name = bytearray(e[0:11])
-            if name[0] == 0x05:
-                name[0] = 0xE5
-            return name.decode('latin-1').rstrip(' ')
-    return ''
-
-
-@register_collector('fat', 'full')
-def collect_fat(dev):
-    try:
-        fh = open(dev, 'rb', buffering=0)
-    except OSError as e:
-        raise RuntimeError(f"无法打开设备 {dev}: {e}")
-
-    with fh:
-        bs = _read_at(fh, 0, 512)
-        bpb = _parse_bpb(bs)
-
-        bps = bpb['bytes_per_sector']
-        spc = bpb['sectors_per_cluster']
-        cluster_size = bps * spc
-        cluster_count = bpb['cluster_count']
-
-        if bpb['fat_type'] == 32:
-            root_off = (bpb['data_start'] * bps
-                        + (bpb['root_cluster'] - 2) * cluster_size)
-            root = _read_chain(fh, bpb['fat_start'], bpb['data_start'] * bps,
-                               cluster_size, bpb['root_cluster'], READ_CAP)
-        else:
-            root_off = ((bpb['reserved'] + bpb['nfats'] * bpb['fat_size'])
-                        * bps)
-            root = _read_at(fh, root_off, bpb['root_entries'] * 32)
-
-        label = _label_from_dir(root) or bpb['bpb_label'] or '-'
-
-        runs, free = _scan_fat_free(fh, bpb)
-
-    used = cluster_count - free
-    pct = free / cluster_count * 100 if cluster_count else 0
-    rows, row_size = _chunk_rows(cluster_count, runs)
-
-    fields = [
-        ('文件系统', f"FAT{bpb['fat_type']}"),
-        ('卷标', label),
-        ('卷序列号', f"0x{bpb['volume_id']:08X}"),
-        ('OEM 标识', bpb['oem'] or '-'),
-        ('每扇区字节', f"{bps}"),
-        ('每簇扇区', f"{spc}"),
-        ('簇大小', human_size(cluster_size)),
-        ('扇区总数', f"{bpb['total_sectors']:,}"),
-        ('设备容量', human_size(bpb['total_sectors'] * bps)),
-        ('保留扇区', f"{bpb['reserved']:,}"),
-        ('FAT 数量', f"{bpb['nfats']}"),
-        ('FAT 大小', f"{bpb['fat_size']:,} 扇区 "
-                   f"({human_size(bpb['fat_size'] * bps)})"),
-        ('数据区起始', f"扇区 {bpb['data_start']:,}"),
-        ('簇总数', f"{cluster_count:,}"),
-        ('空闲簇', f"{free:,}"),
-        ('已用簇', f"{used:,}"),
-        ('空闲比例', f"{pct:.2f}%"),
-    ]
-
-    info = (f"引导扇区 (Boot Sector)\n"
-            f"{_hexdump(bs)}\n\n"
-            f"根目录起始: 扇区 {root_off // bps:,}"
-            f"    根目录项数: {bpb['root_entries'] or '可变 (FAT32)'}\n"
-            f"BPB 文件系统类型字符串: {bpb['type_str'] or '-'}\n")
-
-    return {
-        'dev': dev, 'fs': 'fat',
-        'fields': fields,
-        'info': info,
-        'cluster_size': cluster_size,
-        'cluster_count': cluster_count,
-        'free_clusters': free,
-        'rows': rows,
-        'row_size': row_size,
-    }
-
-
-# =============================================================================
-# Part 2 · exFAT 采集（root 侧）
-# =============================================================================
-def _exfat_next(fh, fat_start, cluster):
-    return _u32(_read_at(fh, fat_start + cluster * 4, 4), 0) & 0x0FFFFFFF
-
-
-def _exfat_chain(fh, fat_start, heap_start, cluster_size, start, max_bytes):
-    out = bytearray()
-    seen = set()
-    c = start
-    while 2 <= c < 0x0FFFFFF8 and len(out) < max_bytes:
-        if c in seen:
-            break
-        seen.add(c)
-        out += _read_at(fh, heap_start + (c - 2) * cluster_size, cluster_size)
-        c = _exfat_next(fh, fat_start, c)
-    return bytes(out)
-
-
-def _exfat_root_entries(root):
-    """扫描根目录，取出分配位图 / 大写表 / 卷标条目"""
-    bitmap = upcase = None
-    label = ''
+def _parse_runs(buf, start_vcn=0):
+    """解析 NTFS 数据运行列表，返回绝对 VCN 的 [(vcn, lcn|None, count), ...]"""
+    runs = []
     i = 0
-    while i + 32 <= len(root):
-        e = root[i:i + 32]
-        t = e[0]
-        if t == 0x00:
+    vcn = start_vcn
+    lcn = 0
+    while i < len(buf):
+        header = buf[i]
+        i += 1
+        if header == 0:
             break
-        if t == 0x81:
-            bitmap = {'cluster': _u32(e, 20), 'length': _u64(e, 24)}
-        elif t == 0x82:
-            upcase = {'cluster': _u32(e, 20), 'length': _u64(e, 24)}
-        elif t == 0x83:
-            n = min(e[1], 11)
-            label = e[2:2 + n * 2].decode('utf-16-le', 'replace')
-        # 关键条目 (>=0x80) 的 byte[1] 低 5 位是二级条目数
-        step = 1 + (e[1] & 0x1F) if (t >= 0x80 and t != 0x83) else 1
-        i += step * 32
-    return bitmap, upcase, label
+        len_size = header & 0x0F
+        off_size = (header >> 4) & 0x0F
+        if len_size == 0 or i + len_size + off_size > len(buf):
+            break
+        length = int.from_bytes(buf[i:i + len_size], 'little')
+        i += len_size
+        if length == 0:
+            break
+        if off_size == 0:
+            runs.append((vcn, None, length))          # 稀疏运行
+        else:
+            delta = int.from_bytes(buf[i:i + off_size], 'little', signed=True)
+            i += off_size
+            lcn += delta
+            runs.append((vcn, lcn, length))
+        vcn += length
+    return runs
 
 
-@register_collector('exfat', 'full')
-def collect_exfat(dev):
+def _iter_attrs(rec):
+    if rec[0:4] != b'FILE':
+        return
+    attr_off = _u16(rec, 0x14)
+    used = _u32(rec, 0x18)
+    end = min(len(rec), used) if used else len(rec)
+    while attr_off + 8 <= end:
+        atype = _u32(rec, attr_off)
+        if atype == 0xFFFFFFFF:
+            break
+        alen = _u32(rec, attr_off + 4)
+        if alen < 0x18 or attr_off + alen > len(rec):
+            break
+        nonres = rec[attr_off + 8]
+        namelen = rec[attr_off + 9]
+        nameoff = _u16(rec, attr_off + 0x0A)
+        name = ''
+        if namelen and attr_off + nameoff + namelen * 2 <= len(rec):
+            name = rec[attr_off + nameoff:
+                       attr_off + nameoff + namelen * 2].decode(
+                           'utf-16-le', 'replace')
+        a = {'type': atype, 'nonres': bool(nonres), 'name': name,
+             'aid': _u16(rec, attr_off + 0x0E)}
+        if nonres:
+            a['start_vcn'] = _u64(rec, attr_off + 0x10)
+            dro = _u16(rec, attr_off + 0x20)
+            a['alloc_size'] = _u64(rec, attr_off + 0x28)
+            a['data_size'] = _u64(rec, attr_off + 0x30)
+            a['runs'] = _parse_runs(rec[attr_off + dro: attr_off + alen],
+                                    a['start_vcn'])
+        else:
+            clen = _u32(rec, attr_off + 0x10)
+            coff = _u16(rec, attr_off + 0x14)
+            a['data'] = rec[attr_off + coff: attr_off + coff + clen]
+            a['data_size'] = clen
+            a['alloc_size'] = clen
+            a['start_vcn'] = 0
+            a['runs'] = []
+        yield a
+        attr_off += alen
+
+
+def _find_attr(attrs, atype, name=None):
+    for a in attrs:
+        if a['type'] != atype:
+            continue
+        if name is not None and a['name'] != name:
+            continue
+        return a
+    return None
+
+
+def _find_run(runs, vcn):
+    """二分查找包含 vcn 的数据运行（runs 按 VCN 升序）"""
+    lo, hi = 0, len(runs) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        vcn_start, lcn, count = runs[mid]
+        if vcn < vcn_start:
+            hi = mid - 1
+        elif vcn >= vcn_start + count:
+            lo = mid + 1
+        else:
+            return runs[mid]
+    return None
+
+
+def _map_vcn(runs, vcn):
+    run = _find_run(runs, vcn)
+    if run is None or run[1] is None:
+        return None
+    return run[1] + (vcn - run[0])
+
+
+def _read_by_runs(fh, boot, runs, start_vcn, size):
+    """按运行表读取数据，同一物理连续段合并为一次 read（减少系统调用）"""
+    cs = boot['cluster_size']
+    out = bytearray()
+    vcn = start_vcn
+    remaining = size
+    while remaining > 0:
+        run = _find_run(runs, vcn)
+        if run is None or run[1] is None:
+            break
+        vcn_start, lcn, count = run
+        off = vcn - vcn_start
+        nclusters = min(count - off, _ceil_div(remaining, cs))
+        take = min(nclusters * cs, remaining)
+        out += _read_at(fh, (lcn + off) * cs, take)
+        vcn += nclusters
+        remaining -= take
+    return bytes(out)
+
+
+def _read_mft_record(fh, boot, runs, rec_no):
+    cs = boot['cluster_size']
+    rec_size = boot['mft_record_size']
+    off = rec_no * rec_size
+    size = rec_size
+    out = bytearray()
+    while size > 0:
+        vcn = off // cs
+        skip = off % cs
+        lcn = _map_vcn(runs, vcn)
+        if lcn is None:
+            return None
+        take = min(cs - skip, size)
+        out += _read_at(fh, lcn * cs + skip, take)
+        off += take
+        size -= take
+    return _fixup(bytes(out), boot['bytes_per_sector'])
+
+
+def _attr_data(fh, boot, attr):
+    if not attr['nonres']:
+        return attr['data']
+    return _read_by_runs(fh, boot, attr['runs'], attr['start_vcn'],
+                         attr['data_size'])
+
+
+def _merge_runs(runs):
+    return sorted(runs, key=lambda r: r[0])
+
+
+def _parse_attr_list(data):
+    entries = []
+    i = 0
+    while i + 0x1A <= len(data):
+        atype = _u32(data, i)
+        if atype in (0, 0xFFFFFFFF):
+            break
+        alen = _u16(data, i + 4)
+        if alen < 0x1A or i + alen > len(data):
+            break
+        entries.append({
+            'type': atype,
+            'name_len': data[i + 6],
+            'start_vcn': _u64(data, i + 8),
+            'ref': _u64(data, i + 0x10),
+            'aid': _u16(data, i + 0x18),
+        })
+        i += alen
+    return entries
+
+
+def _mft_map(fh, boot):
+    """返回 ($MFT 数据运行表, MFT 已分配字节数)，必要时跟随属性列表"""
+    cs = boot['cluster_size']
+    rec_size = boot['mft_record_size']
+
+    rec0 = _fixup(_read_at(fh, boot['mft_lcn'] * cs, rec_size),
+                  boot['bytes_per_sector'])
+    attrs = list(_iter_attrs(rec0))
+    data = _find_attr(attrs, ATTR_DATA, '')
+    if data is None:
+        raise RuntimeError("NTFS $MFT 缺少 $DATA 属性")
+    runs = list(data['runs'])
+    alloc = data['alloc_size'] or data['data_size']
+    if not runs and not data['nonres']:
+        raise RuntimeError("NTFS $MFT 数据为常驻属性，结构异常")
+
+    need_vcn = _ceil_div(alloc, cs)
+    covered = max((v + c for v, _, c in runs), default=0)
+    alist = _find_attr(attrs, ATTR_ATTRIBUTE_LIST, '')
+
+    if alist is not None and covered < need_vcn:
+        entries = _parse_attr_list(_attr_data(fh, boot, alist))
+        for e in sorted(entries, key=lambda x: x['start_vcn']):
+            if e['type'] != ATTR_DATA or e['name_len'] != 0:
+                continue
+            rec_no = e['ref'] & 0xFFFFFFFFFFFF
+            ext = _read_mft_record(fh, boot, runs, rec_no)
+            if ext is None:
+                continue
+            for a in _iter_attrs(ext):
+                if (a['type'] == ATTR_DATA and not a['nonres']
+                        and a['name'] == ''
+                        and a['start_vcn'] == e['start_vcn']):
+                    runs.extend(a['runs'])
+                    break
+        runs = _merge_runs(runs)
+
+    return runs, alloc
+
+
+@register_collector('ntfs', 'full')
+def collect_ntfs(dev):
     try:
         fh = open(dev, 'rb', buffering=0)
     except OSError as e:
@@ -560,84 +457,87 @@ def collect_exfat(dev):
 
     with fh:
         bs = _read_at(fh, 0, 512)
-        if len(bs) < 512 or bs[3:11] != b'EXFAT   ':
-            raise RuntimeError("不是有效的 exFAT 引导扇区")
+        boot = _parse_boot(bs)
+        cluster_count = boot['cluster_count']
 
-        volume_length = _u64(bs, 0x48)
-        fat_offset = _u32(bs, 0x50)
-        fat_length = _u32(bs, 0x54)
-        heap_offset = _u32(bs, 0x58)
-        cluster_count = _u32(bs, 0x5C)
-        root_cluster = _u32(bs, 0x60)
-        serial = _u32(bs, 0x64)
-        revision = _u16(bs, 0x68)
-        percent = bs[0x70]
-        bps = 1 << bs[0x6C]
-        spc = 1 << bs[0x6D]
-        nfats = bs[0x6E]
+        runs, mft_alloc = _mft_map(fh, boot)
 
-        if bps not in (512, 1024, 2048, 4096) or spc == 0:
-            raise RuntimeError("exFAT 引导扇区字段非法")
-        cluster_size = bps * spc
-        fat_start = fat_offset * bps
-        heap_start = heap_offset * bps
-
-        root = _exfat_chain(fh, fat_start, heap_start, cluster_size,
-                            root_cluster, READ_CAP)
-        bitmap, upcase, label = _exfat_root_entries(root)
-        if bitmap is None or bitmap['cluster'] < 2:
-            raise RuntimeError("exFAT 根目录中未找到分配位图")
-
-        bm = _exfat_chain(fh, fat_start, heap_start, cluster_size,
-                          bitmap['cluster'], bitmap['length'] or READ_CAP)
+        bmp_rec = _read_mft_record(fh, boot, runs, MFT_BITMAP)
+        if bmp_rec is None:
+            raise RuntimeError("无法定位 $Bitmap（MFT 映射不完整）")
+        bmp_attr = _find_attr(list(_iter_attrs(bmp_rec)), ATTR_DATA, '')
+        if bmp_attr is None:
+            raise RuntimeError("$Bitmap 缺少 unnamed $DATA 属性")
+        bm = _attr_data(fh, boot, bmp_attr)
         if len(bm) < _ceil_div(cluster_count, 8):
-            raise RuntimeError("exFAT 分配位图读取不完整")
+            raise RuntimeError("$Bitmap 读取不完整")
 
-    runs, free = _scan_bitmap_free(bm, cluster_count, base=2)
+        label = ''
+        volume_version = ''
+        vol_rec = _read_mft_record(fh, boot, runs, MFT_VOLUME)
+        if vol_rec is not None:
+            for a in _iter_attrs(vol_rec):
+                if a['type'] == ATTR_VOLUME_NAME and not a['nonres']:
+                    label = a['data'].decode('utf-16-le', 'replace').strip()
+                elif a['type'] == ATTR_VOLUME_INFO and not a['nonres']:
+                    if len(a['data']) >= 10:
+                        volume_version = f"{a['data'][8]}.{a['data'][9]}"
+
+        mft_records = mft_alloc // boot['mft_record_size']
+        mft_in_use = None
+        mft_bmp = _find_attr(list(_iter_attrs(_fixup(
+            _read_at(fh, boot['mft_lcn'] * boot['cluster_size'],
+                     boot['mft_record_size']),
+            boot['bytes_per_sector']))), ATTR_BITMAP, None)
+        if mft_bmp is not None:
+            try:
+                mb = _attr_data(fh, boot, mft_bmp)
+                mft_in_use = int.from_bytes(mb, 'little').bit_count()
+            except Exception:
+                mft_in_use = None
+
+    free_runs, free = _scan_bitmap_free(bm, cluster_count)
 
     used = cluster_count - free
     pct = free / cluster_count * 100 if cluster_count else 0
-    rows, row_size = _chunk_rows(cluster_count, runs)
+    rows, row_size = _chunk_rows(cluster_count, free_runs, base=0)
 
     fields = [
-        ('文件系统', 'exFAT'),
+        ('文件系统', 'NTFS'),
         ('卷标', label or '-'),
-        ('卷序列号', f"0x{serial:08X}"),
-        ('版本', f"{revision >> 8}.{revision & 0xFF}"),
-        ('每扇区字节', f"{bps}"),
-        ('每簇扇区', f"{spc}"),
-        ('簇大小', human_size(cluster_size)),
-        ('卷长度', f"{volume_length:,} 扇区 "
-                 f"({human_size(volume_length * bps)})"),
-        ('FAT 偏移', f"扇区 {fat_offset:,}"),
-        ('FAT 长度', f"{fat_length:,} 扇区 "
-                   f"({human_size(fat_length * bps)})"),
-        ('FAT 数量', f"{nfats}"),
-        ('簇堆偏移', f"扇区 {heap_offset:,}"),
+        ('版本', volume_version or '-'),
+        ('卷序列号', f"0x{boot['serial']:016X}"),
+        ('每扇区字节', f"{boot['bytes_per_sector']}"),
+        ('每簇扇区', f"{boot['sectors_per_cluster']}"),
+        ('簇大小', human_size(boot['cluster_size'])),
+        ('扇区总数', f"{boot['total_sectors']:,}"),
+        ('设备容量', human_size(boot['total_sectors']
+                            * boot['bytes_per_sector'])),
         ('簇总数', f"{cluster_count:,}"),
         ('空闲簇', f"{free:,}"),
         ('已用簇', f"{used:,}"),
         ('空闲比例', f"{pct:.2f}%"),
-        ('根目录簇', f"{root_cluster}"),
-        ('分配位图', f"簇 {bitmap['cluster']} · "
-                   f"{human_size(bitmap['length'])}"),
-        ('大写表', (f"簇 {upcase['cluster']} · {human_size(upcase['length'])}"
-                  if upcase else '-')),
-        ('卷内占用记录', f"{percent}%" if percent not in (0, 0xFF) else '-'),
+        ('MFT 起始簇', f"{boot['mft_lcn']:,}"),
+        ('MFT 镜像起始簇', f"{boot['mftmirr_lcn']:,}"),
+        ('MFT 记录大小', f"{boot['mft_record_size']} B"),
+        ('MFT 记录数', f"{mft_records:,}"
+                     + (f"（在用 {mft_in_use:,}）"
+                        if mft_in_use is not None else "")),
+        ('索引记录大小', f"{boot['index_record_size']} B"),
     ]
 
     info = (f"引导扇区 (Boot Sector)\n"
             f"{_hexdump(bs)}\n\n"
-            f"FAT 起始字节: {fat_start:,}    "
-            f"簇堆起始字节: {heap_start:,}\n"
-            f"分配位图 (Allocation Bitmap): 簇 {bitmap['cluster']} · "
-            f"{bitmap['length']:,} 字节\n")
+            f"$MFT 数据运行段数: {len(runs)}    "
+            f"$MFT 已分配: {human_size(mft_alloc)}\n"
+            f"$Bitmap 数据: {len(bm):,} 字节    "
+            f"空闲区间数: {len(free_runs):,}\n")
 
     return {
-        'dev': dev, 'fs': 'exfat',
+        'dev': dev, 'fs': 'ntfs',
         'fields': fields,
         'info': info,
-        'cluster_size': cluster_size,
+        'cluster_size': boot['cluster_size'],
         'cluster_count': cluster_count,
         'free_clusters': free,
         'rows': rows,
@@ -646,12 +546,12 @@ def collect_exfat(dev):
 
 
 # =============================================================================
-# Part 2.5 · 簇热力图（主视图：回答"全局分布"）
+# Part 2 · 簇热力图（主视图：回答"全局分布"）
 # =============================================================================
 class _ClusterHeatmap(QWidget):
     """
-    借鉴 ext4 的块组热力图：把等大小的"区"（连续簇段）排成矩阵，
-    一格 = 一个区，颜色浓淡 = 使用率（绿=空 → 黄=半 → 红=满）。
+    借鉴 ext4 的块组热力图：把等大小的"区"排成矩阵，一格 = 一个区，
+    颜色浓淡 = 使用率（绿=空 → 黄=半 → 红=满）。
     左键点击某格 → cell_clicked(区号)，用于跳转到空闲可视化对应行。
     """
     cell_clicked = Signal(int)
@@ -660,9 +560,9 @@ class _ClusterHeatmap(QWidget):
     GAP = 3
 
     C_BG    = QColor('#ffffff')
-    C_EMPTY = QColor('#22c55e')   # 全空
-    C_HALF  = QColor('#eab308')   # 半满
-    C_FULL  = QColor('#ef4444')   # 全满
+    C_EMPTY = QColor('#22c55e')
+    C_HALF  = QColor('#eab308')
+    C_FULL  = QColor('#ef4444')
     C_DIM   = QColor('#666666')
     C_HOVER = QColor('#111111')
 
@@ -679,7 +579,6 @@ class _ClusterHeatmap(QWidget):
         self._hover = None
         self._hover_pos = None
 
-    # ---------------- 数据 / 尺寸 ----------------
     def set_data(self, dev, rows, cluster_size=4096):
         self.dev = dev
         self.rows = list(rows or [])
@@ -735,7 +634,6 @@ class _ClusterHeatmap(QWidget):
         self._relayout()
         super().resizeEvent(event)
 
-    # ---------------- 颜色 ----------------
     def _used_ratio(self, r):
         length = r.get('length') or 0
         free = r.get('free') or 0
@@ -754,7 +652,6 @@ class _ClusterHeatmap(QWidget):
                       int(a.green() + (b.green() - a.green()) * t),
                       int(a.blue() + (b.blue() - a.blue()) * t))
 
-    # ---------------- 绘制 ----------------
     def paintEvent(self, event):
         p = QPainter(self)
         p.fillRect(self.rect(), self.C_BG)
@@ -868,7 +765,6 @@ class _ClusterHeatmap(QWidget):
             p.drawText(QRectF(x + 10 + lw + gap, ly, vw + 4, lh),
                        Qt.AlignLeft | Qt.AlignVCenter, v)
 
-    # ---------------- 交互 ----------------
     def _index_at(self, pos):
         if not self.rows:
             return None
@@ -918,14 +814,16 @@ class _ClusterHeatmap(QWidget):
 
 
 # =============================================================================
-# Part 3 · Tab 集合（FAT 与 exFAT 共用，靠子类区分 TAB_FS）
+# Part 3 · Tab 集合
 # =============================================================================
-class _ClusterOverviewTab(TabPlugin):
+@register_tab
+class NtfsOverviewTab(TabPlugin):
+    TAB_FS = 'ntfs'
     TAB_ORDER = 10
     TAB_ID = 'overview'
     TAB_TITLE = '概览'
     NEEDS = ('full',)
-    EMPTY_TEXT = '请在起始页选择一个设备'
+    EMPTY_TEXT = '请在起始页选择一个 NTFS 设备'
 
     def __init__(self):
         super().__init__()
@@ -958,18 +856,19 @@ class _ClusterOverviewTab(TabPlugin):
         scroll.setWidget(content)
         outer.addWidget(scroll)
 
-    def update_data(self, payloads):
-        payload = payloads.get('full')
-        if not payload:
-            return
-        self.title.setText(f"设备: {payload.get('dev')}")
-
+    def _clear_grid(self):
         while self.grid.count():
             item = self.grid.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
 
+    def update_data(self, payloads):
+        payload = payloads.get('full')
+        if not payload:
+            return
+        self.title.setText(f"设备: {payload.get('dev')}")
+        self._clear_grid()
         for i, (k, v) in enumerate(payload.get('fields', [])):
             key = QLabel(f"{k}:")
             key.setStyleSheet("color:#555;")
@@ -980,28 +879,25 @@ class _ClusterOverviewTab(TabPlugin):
             self.grid.addWidget(key, i, 0)
             self.grid.addWidget(val, i, 1)
         self.grid.setColumnStretch(1, 1)
-
         self.info_text.setPlainText(payload.get('info', ''))
 
     def clear(self):
         self.title.setText(self.EMPTY_TEXT)
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
+        self._clear_grid()
         self.info_text.clear()
 
 
-class _ClusterTableTab(TabPlugin):
+@register_tab
+class NtfsClusterTableTab(TabPlugin):
     """簇分布：每一"区"（连续簇段）的空闲/使用统计，点击跳到可视化"""
 
+    TAB_FS = 'ntfs'
     TAB_ORDER = 20
     TAB_ID = 'chunks'
     TAB_TITLE = '簇分布'
     NEEDS = ('full',)
 
-    group_activated = Signal(int)   # 点击某区 → 跳转到空闲可视化对应行
+    group_activated = Signal(int)
 
     COLS = ['区', '起始簇', '簇数', '空闲簇', '已用簇', '空闲%', '空闲段数']
 
@@ -1031,15 +927,8 @@ class _ClusterTableTab(TabPlugin):
             free = sum(c for _, c in recs)
             used = total - free
             pct = free / total * 100 if total else 0
-            vals = [
-                f"区 {row_no}",
-                f"{2 + i * row_size:,}",
-                f"{total:,}",
-                f"{free:,}",
-                f"{used:,}",
-                f"{pct:.2f}%",
-                f"{len(recs)}",
-            ]
+            vals = [f"区 {row_no}", f"{i * row_size:,}", f"{total:,}",
+                    f"{free:,}", f"{used:,}", f"{pct:.2f}%", f"{len(recs)}"]
             for c, v in enumerate(vals):
                 item = QTableWidgetItem(v)
                 item.setTextAlignment(Qt.AlignCenter)
@@ -1049,16 +938,18 @@ class _ClusterTableTab(TabPlugin):
         self.table.setRowCount(0)
 
 
-class _ClusterHeatmapTab(TabPlugin):
+@register_tab
+class NtfsHeatmapTab(TabPlugin):
     """主视图：簇热力图，回答"全局分布"（哪片区域空、哪片区域满）"""
 
+    TAB_FS = 'ntfs'
     TAB_ORDER = 30
     TAB_ID = 'heatmap'
     TAB_TITLE = '簇热力图'
     NEEDS = ('full',)
-    EMPTY_TEXT = '请在起始页选择一个设备'
+    EMPTY_TEXT = '请在起始页选择一个 NTFS 设备'
 
-    group_activated = Signal(int)   # 点击某区 → 跳转到空闲可视化
+    group_activated = Signal(int)
 
     LEGEND = ("<span style='color:#22c55e'>■</span> 空　"
               "<span style='color:#eab308'>■</span> 半　"
@@ -1095,7 +986,7 @@ class _ClusterHeatmapTab(TabPlugin):
         for i, (row_no, recs) in enumerate(payload.get('rows', [])):
             length = min(row_size, max(0, cluster_count - i * row_size))
             free = sum(c for _, c in recs)
-            rows.append({'row': row_no, 'start': 2 + i * row_size,
+            rows.append({'row': row_no, 'start': i * row_size,
                          'length': length, 'free': free,
                          'segments': len(recs)})
 
@@ -1112,12 +1003,14 @@ class _ClusterHeatmapTab(TabPlugin):
         self.heat.clear()
 
 
-class _ClusterPlotTab(TabPlugin):
+@register_tab
+class NtfsPlotTab(TabPlugin):
+    TAB_FS = 'ntfs'
     TAB_ORDER = 40
     TAB_ID = 'plot'
     TAB_TITLE = '空闲可视化'
     NEEDS = ('full',)
-    EMPTY_TEXT = '请在起始页选择一个设备'
+    EMPTY_TEXT = '请在起始页选择一个 NTFS 设备'
     ROW_PREFIX = '区'
 
     def __init__(self):
@@ -1166,82 +1059,21 @@ class _ClusterPlotTab(TabPlugin):
                             int(payload.get('cluster_size') or 4096))
 
     def focus_group(self, row_index):
-        """定位到指定"区"（供簇分布表点击跳转）"""
         return self.chart.focus_row(row_index)
 
     def clear(self):
         self.chart.clear()
 
 
-# --------------------------- FAT12/16/32 Tab ---------------------------
-@register_tab
-class FatOverviewTab(_ClusterOverviewTab):
-    TAB_FS = 'fat'
-    EMPTY_TEXT = '请在起始页选择一个 FAT 设备'
-
-
-@register_tab
-class FatClusterTableTab(_ClusterTableTab):
-    TAB_FS = 'fat'
-
-
-@register_tab
-class FatHeatmapTab(_ClusterHeatmapTab):
-    TAB_FS = 'fat'
-    EMPTY_TEXT = '请在起始页选择一个 FAT 设备'
-
-
-@register_tab
-class FatPlotTab(_ClusterPlotTab):
-    TAB_FS = 'fat'
-    EMPTY_TEXT = '请在起始页选择一个 FAT 设备'
-
-
-# --------------------------- exFAT Tab ---------------------------
-@register_tab
-class ExfatOverviewTab(_ClusterOverviewTab):
-    TAB_FS = 'exfat'
-    EMPTY_TEXT = '请在起始页选择一个 exFAT 设备'
-
-
-@register_tab
-class ExfatClusterTableTab(_ClusterTableTab):
-    TAB_FS = 'exfat'
-
-
-@register_tab
-class ExfatHeatmapTab(_ClusterHeatmapTab):
-    TAB_FS = 'exfat'
-    EMPTY_TEXT = '请在起始页选择一个 exFAT 设备'
-
-
-@register_tab
-class ExfatPlotTab(_ClusterPlotTab):
-    TAB_FS = 'exfat'
-    EMPTY_TEXT = '请在起始页选择一个 exFAT 设备'
-
-
 # =============================================================================
 # Part 4 · 包描述
 # =============================================================================
 @register_pack
-class FatPack(FSPack):
-    FS_ID = 'fat'
-    FS_NAME = 'FAT12/16/32'
-    ORDER = 30
+class NtfsPack(FSPack):
+    FS_ID = 'ntfs'
+    FS_NAME = 'NTFS'
+    ORDER = 25
 
     @classmethod
     def matches_fstype(cls, fstype):
-        return (fstype or '').lower() in (
-            'vfat', 'fat', 'msdos', 'fat12', 'fat16', 'fat32')
-
-
-@register_pack
-class ExfatPack(FSPack):
-    FS_ID = 'exfat'
-    FS_NAME = 'exFAT'
-    ORDER = 31
-
-    @classmethod
-    def matches_fstype(cls, fstype):
-        return (fstype or '').lower() == 'exfat'
+        return (fstype or '').lower() in ('ntfs', 'ntfs3')
