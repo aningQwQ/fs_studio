@@ -16,6 +16,7 @@ fs_packs.f2fs — F2FS 包
 
 带走这个包 = 复制本文件。
 """
+import os
 import re
 import struct
 
@@ -372,6 +373,36 @@ def _parse_sb(raw):
     return sb
 
 
+def _live_statvfs(dev):
+    """
+    如果 dev 正被挂载，返回 (挂载点, 已用块, 可用块, 块大小)；否则返回 None。
+    用于和"盘上检查点"对账：挂载期间 f2fs 未落盘时，检查点会明显落后。
+    """
+    try:
+        want = os.path.realpath(dev)
+    except OSError:
+        return None
+    try:
+        with open('/proc/mounts') as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        src, mnt = parts[0], parts[1].replace('\\040', ' ')
+        try:
+            if os.path.realpath(src) != want:
+                continue
+            st = os.statvfs(mnt)
+        except OSError:
+            continue
+        if st.f_blocks and st.f_frsize:
+            return (mnt, st.f_blocks - st.f_bfree, st.f_bavail, st.f_frsize)
+    return None
+
+
 def _fmt_uuid(b):
     h = b.hex()
     return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
@@ -656,6 +687,21 @@ def collect_f2fs(dev):
     if not ckpt_strict:
         notes.append("检查点未通过严格校验（字段可能来自旧版本或镜像有损）")
 
+    # ---- 与内核实时状态对账（挂载中时才有意义）----
+    # 期望的 statvfs 已用 = 有效块 + 元数据区块数 + overprovision(+GC 保留) 段
+    meta_blocks = (sb['block_count'] - sb['segment0_blkaddr'] - main_blocks)
+    fixed_blocks = meta_blocks + ckpt['overprov_segment_count'] * bps
+    expect_used = valid_sum + fixed_blocks
+    live = _live_statvfs(dev)
+    live_ok = None
+    if live is not None:
+        mnt, live_used, live_avail, live_bs = live
+        diff = live_used - expect_used
+        if abs(diff) > max(1024, main_blocks // 100):
+            live_ok = False
+        else:
+            live_ok = True
+
     flags = ckpt['ckpt_flags']
     unmounted = bool(flags & CP_UMOUNT_FLAG)
     verify = '一致' if valid_sum == ckpt['valid_block_count'] else (
@@ -701,11 +747,22 @@ def collect_f2fs(dev):
         ('根 / 节点 / 元数据 inode', f"{sb['root_ino']} / {sb['node_ino']} / "
                                     f"{sb['meta_ino']}"),
         ('检查点版本', f"0x{ckpt['checkpoint_ver']:016X}"),
-        ('卸载状态', '干净卸载（CP_UMOUNT）' if unmounted else
-                    '未干净卸载（元数据可能滞后）'),
+        ('检查点写入时机', '卸载时（CP_UMOUNT，内容完整）' if unmounted else
+                          '运行中（可能滞后）'),
         ('SIT 日志条目', f"{n_journal}"),
         ('SIT 与检查点校验', verify),
     ]
+    if live is not None:
+        mnt, live_used, live_avail, live_bs = live
+        diff = live_used - expect_used
+        fields += [
+            ('挂载点', f"{mnt}（实时 {human_size(live_used * live_bs)} 已用 / "
+                      f"{human_size(live_avail * live_bs)} 可用）"),
+            ('检查点 vs 实时',
+             '一致' if live_ok else
+             f"盘上检查点落后 {human_size(abs(diff) * bs)}"
+             f"（{'内核更少，说明挂载期间的改动尚未落盘' if diff < 0 else '内核更多'}）"),
+        ]
 
     info_lines = [
         f"超级块 (Super Block @ 偏移 {SB_OFFSET})",
@@ -741,6 +798,13 @@ def collect_f2fs(dev):
         f"另有 ovp+保留段 {segs_reserved} 段（{human_size(segs_reserved * seg_size)}）"
         f"不可分配",
     ]
+    if live is not None and not live_ok:
+        mnt, live_used, live_avail, live_bs = live
+        info_lines.append(
+            f"警告: 内核实时已用 {live_used:,} 块，而盘上检查点应有 {expect_used:,} 块"
+            f"（差 {abs(live_used - expect_used):,} 块）。"
+            f"说明 f2fs 还没把最新状态写成检查点，本页是旧快照；"
+            f"请 sync / 卸载后重新采集（例如 udisksctl unmount -b {dev}）。")
     for n in notes:
         info_lines.append(f"注意: {n}")
 
