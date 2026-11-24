@@ -217,7 +217,7 @@ def _free_bits_in(bm, start_bit, nbits):
     return total
 
 
-def _binned_runs(bm, total_bits, row_blocks, nrows):
+def _binned_runs(bm, total_bits, row_blocks, nrows, bits_per_seg, seg_empty):
     """
     病态碎片时的降级表示：把每行再切成 BINS_PER_ROW 个箱，箱内只保留
     "空闲块数"，画在箱首。每行空闲块数仍然精确，只是箱内定位粗糙。
@@ -225,6 +225,7 @@ def _binned_runs(bm, total_bits, row_blocks, nrows):
     rows = [[i, []] for i in range(nrows)]
     free_total = 0
     bin_blocks = max(1, _ceil_div(row_blocks, BINS_PER_ROW))
+    nseg = len(seg_empty)
     for i in range(nrows):
         base_bit = i * row_blocks
         row_bits = min(row_blocks, total_bits - base_bit)
@@ -235,9 +236,14 @@ def _binned_runs(bm, total_bits, row_blocks, nrows):
             b0 = k * bin_blocks
             nb = min(bin_blocks, row_bits - b0)
             fb = _free_bits_in(bm, base_bit + b0, nb)
-            if fb:
-                rows[i][1].append((b0, fb))
-                free_total += fb
+            if not fb:
+                continue
+            s0 = base_bit + b0
+            seg0 = min(nseg - 1, s0 // bits_per_seg)
+            seg1 = min(nseg - 1, (s0 + nb - 1) // bits_per_seg)
+            kind = 0 if all(seg_empty[x] for x in range(seg0, seg1 + 1)) else 1
+            rows[i][1].append((b0, fb, kind))
+            free_total += fb
     return rows, free_total
 
 
@@ -264,10 +270,12 @@ def _assemble_used(valid_maps, main_segs, bps):
 
 
 def _split_runs_into_rows(runs, row_blocks, total_blocks):
-    """把空闲区间按 row_blocks 切到各行（行内偏移）"""
+    """把空闲区间按 row_blocks 切到各行（行内偏移），保留 kind"""
     nrows = max(1, _ceil_div(total_blocks, row_blocks))
     rows = [[i, []] for i in range(nrows)]
-    for s, c in runs:
+    for rec in runs:
+        s, c = rec[0], rec[1]
+        kind = rec[2] if len(rec) > 2 else 0
         e = s + c
         while s < e:
             r = s // row_blocks
@@ -277,9 +285,34 @@ def _split_runs_into_rows(runs, row_blocks, total_blocks):
             r1 = min(total_blocks, r0 + row_blocks)
             a, b = max(s, r0), min(e, r1)
             if b > a:
-                rows[r][1].append((a - r0, b - a))
+                rows[r][1].append((a - r0, b - a, kind))
             s = b
     return rows
+
+
+def _classify_runs(runs, bits_per_seg, seg_empty):
+    """
+    按段边界切分空闲区间并标注 kind：
+        0 = 所在段整段皆空（已回到 free_segments，可拿来做连续分配）
+        1 = 段内仍有有效块（块可立即写入，但段还没被 GC 回收）
+    相邻同类区间会被合并，避免区间数爆炸。
+    """
+    out = []
+    nseg = len(seg_empty)
+    for s, c in runs:
+        e = s + c
+        while s < e:
+            seg = s // bits_per_seg
+            if seg >= nseg:
+                break
+            b = min(e, (seg + 1) * bits_per_seg)
+            kind = 0 if seg_empty[seg] else 1
+            if out and out[-1][2] == kind and out[-1][0] + out[-1][1] == s:
+                out[-1] = (out[-1][0], out[-1][1] + (b - s), kind)
+            else:
+                out.append((s, b - s, kind))
+            s = b
+    return out
 
 
 # =============================================================================
@@ -559,19 +592,26 @@ def collect_f2fs(dev):
         notes.append(f"位图粒度 {total_bits:,} 位 != 主区块数 {main_blocks:,}，"
                      f"空闲区间按 {scale} 倍缩放")
 
+    bits_per_seg = max(1, total_bits // main_segs)
+    seg_empty = [v == 0 for v in valid_blocks]
+
     res = _scan_free_runs(used_bits, total_bits)
     binned = res is None
     if binned:
-        rows, free_blocks = _binned_runs(used_bits, total_bits, row_blocks, nrows)
+        rows, free_blocks = _binned_runs(used_bits, total_bits, row_blocks,
+                                         nrows, bits_per_seg, seg_empty)
         notes.append(f"空闲区间过多（>{MAX_RUNS:,}），已按每行 {BINS_PER_ROW} 箱"
                      f"降级绘制；空闲块统计仍然精确")
+        if scale != 1:
+            rows = [[n, [(s * scale, c * scale, k) for s, c, k in recs]]
+                    for n, recs in rows]
     else:
         free_runs, free_blocks = res
+        typed = _classify_runs(free_runs, bits_per_seg, seg_empty)
         if scale != 1:
-            free_runs = [(s * scale, c * scale) for s, c in free_runs]
-        rows = _split_runs_into_rows(free_runs, row_blocks, main_blocks)
-    if scale != 1 and binned:
-        rows = [[n, [(s * scale, c * scale) for s, c in recs]] for n, recs in rows]
+            typed = [(s * scale, c * scale, k) for s, c, k in typed]
+        rows = _split_runs_into_rows(typed, row_blocks, main_blocks)
+    if scale != 1:
         free_blocks *= scale
     free_blocks = min(free_blocks, main_blocks)
     nrows = len(rows)
@@ -580,7 +620,8 @@ def collect_f2fs(dev):
     rows_meta = []
     for i, (row_no, recs) in enumerate(rows):
         blocks = min(row_blocks, main_blocks - i * row_blocks)
-        free = sum(c for _, c in recs)
+        free = sum(rec[1] for rec in recs)
+        stale = sum(rec[1] for rec in recs if len(rec) > 2 and rec[2])
         sec0 = i * group
         nsec = min(group, max(0, section_count - sec0))
         s0 = sec0 * segs_per_sec
@@ -596,6 +637,8 @@ def collect_f2fs(dev):
             'blk0': main_blkaddr + i * row_blocks,
             'blocks': blocks,
             'free': free,
+            'free_stale': stale,
+            'free_clean': free - stale,
             'used': blocks - free,
             'seg_full': sum(1 for v in vb if v >= bps),
             'seg_empty': sum(1 for v in vb if v == 0),
@@ -605,6 +648,10 @@ def collect_f2fs(dev):
     used_pct = (main_blocks - free_blocks) / main_blocks * 100 if main_blocks else 0
     pct = free_blocks / main_blocks * 100 if main_blocks else 0
     seg_size = bps * bs
+    stale_total = sum(m['free_stale'] for m in rows_meta)
+    stale_pct = stale_total / free_blocks * 100 if free_blocks else 0
+    segs_reserved = (ckpt['overprov_segment_count']
+                     + ckpt['rsvd_segment_count'])
 
     if not ckpt_strict:
         notes.append("检查点未通过严格校验（字段可能来自旧版本或镜像有损）")
@@ -632,13 +679,22 @@ def collect_f2fs(dev):
         ('主区起始块', f"{main_blkaddr:,}"),
         ('主区块总数', f"{main_blocks:,}"),
         ('有效块 (SIT)', f"{valid_sum:,}  ({human_size(valid_sum * bs)})"),
-        ('空闲块', f"{free_blocks:,}  ({human_size(free_blocks * bs)})"),
+        ('空闲块（可立即分配）',
+         f"{free_blocks:,}  ({human_size(free_blocks * bs)})"),
+        ('其中·整段已回收',
+         f"{free_blocks - stale_total:,}  "
+         f"({human_size((free_blocks - stale_total) * bs)})"),
+        ('其中·待 GC 回收段',
+         f"{stale_total:,}  ({human_size(stale_total * bs)}，"
+         f"占空闲 {stale_pct:.1f}%)"),
         ('空闲比例', f"{pct:.2f}%"),
         ('已用比例', f"{used_pct:.2f}%"),
         ('空段 / 部分段 / 满段', f"{empty_segs:,} / {part_segs:,} / {full_segs:,}"),
         ('检查点空闲段（不含当前段）', f"{ckpt['free_segment_count']:,}"),
         ('保留段 (GC)', f"{ckpt['rsvd_segment_count']:,}"),
         ('超额配置段', f"{ckpt['overprov_segment_count']:,}"),
+        ('不可用（ovp + 保留段）',
+         f"{segs_reserved:,} 段 / {human_size(segs_reserved * seg_size)}"),
         ('用户可用块', f"{ckpt['user_block_count']:,}"),
         ('有效节点 / inode', f"{ckpt['valid_node_count']:,} / "
                             f"{ckpt['valid_inode_count']:,}"),
@@ -680,6 +736,10 @@ def collect_f2fs(dev):
         f"SIT 解析: 每块 {max(1, bs // SIT_ENTRY_SIZE)} 条目，"
         f"叠加日志 {n_journal} 条，空闲区间 {n_runs:,} 个，"
         f"行数 {nrows}（每行 {group} 区）",
+        f"空闲口径: 可立即分配 {free_blocks:,} 块，其中 "
+        f"{stale_total:,} 块位于尚未整段回收的段内（待 GC）；"
+        f"另有 ovp+保留段 {segs_reserved} 段（{human_size(segs_reserved * seg_size)}）"
+        f"不可分配",
     ]
     for n in notes:
         info_lines.append(f"注意: {n}")
@@ -1063,7 +1123,7 @@ class F2fsSectionTableTab(TabPlugin):
     group_activated = Signal(int)
 
     COLS = ['区', '起始段', '段数', '起始块', '块数',
-            '有效块', '空闲块', '空闲%', '满/部分/空段']
+            '有效块', '空闲块', '其中待回收', '空闲%', '满/部分/空段']
 
     def __init__(self):
         super().__init__()
@@ -1097,6 +1157,7 @@ class F2fsSectionTableTab(TabPlugin):
                 f"{blocks:,}",
                 f"{int(m.get('used') or 0):,}",
                 f"{free:,}",
+                f"{int(m.get('free_stale') or 0):,}",
                 f"{pct:.2f}%",
                 f"{m.get('seg_full', 0)} / {m.get('seg_part', 0)} / "
                 f"{m.get('seg_empty', 0)}",

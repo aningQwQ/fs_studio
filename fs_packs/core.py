@@ -293,8 +293,10 @@ class BlockRangeChart(QWidget):
     C_BG      = QColor('#ffffff')
     C_ROW_ALT = QColor('#fafafa')
     C_USED    = QColor('#3b82f6')
-    C_FREE    = QColor('#e3e3e3')
+    C_FREE    = QColor('#e3e3e3')     # 空闲：所在段已整段回收
     C_FREE_BD = QColor('#cfcfcf')
+    C_FREE_STALE    = QColor('#c4c4c4')   # 空闲但所在段仍有活数据（待 GC）
+    C_FREE_STALE_BD = QColor('#adadad')
     C_TEXT    = QColor('#1a1a1a')
     C_DIM     = QColor('#666666')
     C_EDGE    = QColor('#999999')
@@ -338,8 +340,18 @@ class BlockRangeChart(QWidget):
         hbar.valueChanged.connect(self._on_h_scroll)
         self._sync_scrollbars()
 
+    @staticmethod
+    def _rec_kind(rec):
+        """区间可带第三元素 kind：0=整段皆空，1=段内仍有数据（待 GC）。
+        其它包仍传 (起始块, 块数) 两元组，按 0 处理。"""
+        return rec[2] if len(rec) > 2 else 0
+
+    def _has_stale(self):
+        return any(self._rec_kind(rec)
+                   for _, recs in self.rows for rec in recs)
+
     def set_data(self, dev, rows, row_size, block_size=4096):
-        """rows: [(行号, [(起始块, 块数), ...]), ...]"""
+        """rows: [(行号, [(起始块, 块数[, kind]), ...]), ...]"""
         self.dev = dev
         self.rows = [(n, [tuple(r) for r in recs]) for n, recs in rows]
         self.row_size = max(1, int(row_size or 1))
@@ -456,7 +468,7 @@ class BlockRangeChart(QWidget):
         bar_h = row_h * 0.70
         bar_pad = (row_h - bar_h) / 2
 
-        total_free = sum(sum(c for _, c in r) for _, r in self.rows)
+        total_free = sum(sum(rec[1] for rec in r) for _, r in self.rows)
         total = self.row_size * n
         ratio = total_free / total * 100 if total else 0
 
@@ -483,8 +495,10 @@ class BlockRangeChart(QWidget):
             p.setPen(Qt.NoPen)
             p.fillRect(QRectF(dx, bar_y, dw, bar_h), self.C_USED)
 
-            p.setBrush(self.C_FREE)
-            for s, c in recs:
+            for rec in recs:
+                s, c = rec[0], rec[1]
+                p.setBrush(self.C_FREE_STALE if self._rec_kind(rec)
+                           else self.C_FREE)
                 sx = self._x_to_px(s, W, H)
                 ex = self._x_to_px(s + c, W, H)
                 if ex - sx < 0.75:
@@ -507,7 +521,7 @@ class BlockRangeChart(QWidget):
         for i in range(first, last + 1):
             row_no, recs = self.rows[i]
             row_y = dy + i * row_h - self.v_offset
-            free = sum(c for _, c in recs)
+            free = sum(rec[1] for rec in recs)
             pct = free / self.row_size * 100 if self.row_size else 0
             focused = (self.focus_index == i)
 
@@ -567,18 +581,23 @@ class BlockRangeChart(QWidget):
         gap = 6
 
         items = [(self.C_USED, '已使用'), (self.C_FREE, '空闲')]
-        x = x0
+        if self._has_stale():
+            items.append((self.C_FREE_STALE, '待回收'))
+        x, y = x0, y0
         for color, label in items:
+            tw = fm.horizontalAdvance(label)
+            if x + box + 3 + tw > W - 4:      # 放不下就换行，别压住图表
+                x, y = x0, y + box + 4
             p.setPen(Qt.NoPen)
             p.setBrush(color)
-            p.drawRect(QRectF(x, y0, box, box))
-            if color is self.C_FREE:
-                p.setPen(QPen(self.C_FREE_BD, 1))
+            p.drawRect(QRectF(x, y, box, box))
+            if color is self.C_FREE or color is self.C_FREE_STALE:
+                p.setPen(QPen(self.C_FREE_BD if color is self.C_FREE
+                              else self.C_FREE_STALE_BD, 1))
                 p.setBrush(Qt.NoBrush)
-                p.drawRect(QRectF(x, y0, box, box))
+                p.drawRect(QRectF(x, y, box, box))
             p.setPen(self.C_TEXT)
-            tw = fm.horizontalAdvance(label)
-            p.drawText(QRectF(x + box + 3, y0 - 2, tw + 2, box + 4),
+            p.drawText(QRectF(x + box + 3, y - 2, tw + 2, box + 4),
                        Qt.AlignVCenter, label)
             x += box + 3 + tw + gap
 
@@ -717,7 +736,7 @@ class BlockRangeChart(QWidget):
         row_no, recs = self.rows[row]
         block = self._px_to_x(x, W, H)
 
-        free = sum(c for _, c in recs)
+        free = sum(rec[1] for rec in recs)
         cnt = len(recs)
         pct = free / self.row_size * 100 if self.row_size else 0
 
@@ -725,27 +744,33 @@ class BlockRangeChart(QWidget):
         hit = None
         while lo <= hi:
             mid = (lo + hi) // 2
-            s, c = recs[mid]
+            s, c = recs[mid][0], recs[mid][1]
             if block < s:
                 hi = mid - 1
             elif block >= s + c:
                 lo = mid + 1
             else:
-                hit = (s, c)
+                hit = recs[mid]
                 break
 
         title = (f"{self.row_prefix} {row_no}   ·   空闲 {pct:.2f}%"
                  f"   ·   {cnt} 段")
 
         if hit:
-            s, c = hit
+            s, c = hit[0], hit[1]
             lines = [
                 ("当前块号", f"{int(block):,}"),
                 ("起始块号", f"{s:,}"),
                 ("长度",     f"{c:,} 块   ({human_size(c * self.block_size)})"),
                 ("结束块号", f"{s + c - 1:,}"),
             ]
-            color = self.C_FREE_BD
+            if len(hit) > 2:          # 该包区分了"段是否已回收"
+                kind = hit[2]
+                lines.append(("状态", "空闲（所在段已整段回收）" if kind == 0
+                              else "空闲（段内仍有数据，待 GC）"))
+                color = self.C_FREE_BD if kind == 0 else self.C_FREE_STALE_BD
+            else:
+                color = self.C_FREE_BD
         else:
             lines = [
                 ("当前块号", f"{int(block):,}"),
