@@ -3,7 +3,7 @@
 多文件系统结构与性能分析器。以"设备 + 文件系统包"的方式，只读采集分区元数据，
 用表格、热力图和区间图把**空闲空间的全局分布**直观画出来。
 
-当前支持：**XFS、ext2/3/4、NTFS、FAT12/16/32、exFAT**。
+当前支持：**XFS、ext2/3/4、NTFS、F2FS、FAT12/16/32、exFAT**。
 
 ---
 
@@ -15,8 +15,9 @@
   自动匹配对应包并加载它的 Tab。
 - **只读采集**：不修改任何文件系统；启动时不采集、不弹授权，选中设备后才请求一次
   root 授权（`pkexec`，无则退回 `sudo`）。
-- **零外部依赖解析**：NTFS / FAT / exFAT 的引导扇区、`$MFT`、`$Bitmap`、FAT 表、
-  分配位图都由 Python 直接解析，不依赖 `ntfsprogs` / `dosfstools` / `exfatprogs`。
+- **零外部依赖解析**：NTFS / F2FS / FAT / exFAT 的引导扇区、`$MFT`、`$Bitmap`、
+  检查点、SIT、FAT 表、分配位图都由 Python 直接解析，
+  不依赖 `ntfsprogs` / `f2fs-tools` / `dosfstools` / `exfatprogs`。
 - **大容量也快**：位图/表扫描用 C 级正则整段跳过 + 查表逐字节处理，避免逐簇 Python 循环。
   本机实测 256GB / 4KB 簇（约 6700 万簇）：FAT32 表扫描约 0.1s、exFAT 位图约 0.01s
   （旧的逐簇实现在同一数据上分别约 3.7s / 数秒）。
@@ -64,10 +65,16 @@
 | XFS | `xfs` | `xfs_db`、`xfs_info`（xfsprogs） | 概览 / AG 结构 / 空闲可视化 |
 | ext2/3/4 | `ext4`、`ext3`、`ext2` | `dumpe2fs`（e2fsprogs），可选 `e2freefrag` | 概览 / 块组结构 / 块组热力图 / 空闲区间 |
 | NTFS | `ntfs`、`ntfs3` | 无（直接解析 `$MFT` / `$Bitmap`） | 概览 / 簇分布 / 簇热力图 / 空闲可视化 |
+| F2FS | `f2fs` | 无（直接解析超级块 / 检查点 / SIT） | 概览 / 区分布 / 区热力图 / 空闲可视化 |
 | FAT12/16/32 | `vfat`、`fat`、`msdos`、`fat12/16/32` | 无（直接解析 BPB / FAT 表） | 概览 / 簇分布 / 簇热力图 / 空闲可视化 |
 | exFAT | `exfat` | 无（直接解析引导扇区 / 分配位图） | 概览 / 簇分布 / 簇热力图 / 空闲可视化 |
 
 > FAT12/16/32 的具体类型由 BPB 自动判定；`lsblk` 一律报 `vfat`。
+>
+> F2FS 的「区」= section（默认 1 个 section = 1 个 2 MiB 段）。空闲块不是估算值：
+> 从检查点定位 SIT 区（含版本位图），再把检查点里的 SIT 日志叠加回去，得到每个段的
+> `valid_map` 位图（一块一位），因此刚格式化、SIT 区尚未回写的镜像也能算对。
+> 概览里的「SIT 与检查点校验」会交叉验证 SIT 合计与 `valid_block_count` 是否一致。
 
 ### 各 Tab 说明
 
@@ -149,6 +156,7 @@ fs_packs/
   xfs.py                 XFS   的 collector + Tab 集合
   ext4.py                ext2/3/4 的 collector + Tab 集合
   ntfs.py                NTFS  的 collector + Tab 集合
+  f2fs.py                F2FS  的 collector + Tab 集合
   fat.py                 FAT12/16/32 与 exFAT 的 collector + Tab 集合
 ```
 

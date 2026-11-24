@@ -7,6 +7,7 @@ fs_packs — FS 包集合（自动发现）
     fs_packs/xfs.py   → XFS  的 collector + Tab 集合
     fs_packs/ext4.py  → ext4 的 collector + Tab 集合
     fs_packs/ntfs.py  → NTFS 的 collector + Tab 集合
+    fs_packs/f2fs.py  → F2FS 的 collector + Tab 集合
     fs_packs/fat.py   → FAT12/16/32 与 exFAT 的 collector + Tab 集合
 主窗口通过 core 的注册表按磁盘格式自动加载对应包。
 """
